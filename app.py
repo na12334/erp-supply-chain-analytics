@@ -21,10 +21,10 @@ st.set_page_config(
 @st.cache_data
 def load_data():
     """Load the four tables and join them into one analysis frame."""
-    orders = pd.read_csv("data/orders.csv")
-    order_items = pd.read_csv("data/order_items.csv")
-    products = pd.read_csv("data/products.csv")
-    customers = pd.read_csv("data/customers.csv")
+        orders = pd.read_csv("orders_clean.csv")
+    order_items = pd.read_csv("order_items_clean.csv")
+    products = pd.read_csv("products_clean.csv")
+    customers = pd.read_csv("customers_clean.csv")
 
     # normalise column names so the joins below are predictable
     for df in (orders, order_items, products, customers):
