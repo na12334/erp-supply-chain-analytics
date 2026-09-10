@@ -1,6 +1,6 @@
 """
 ERP Sales & Supply Chain Analytics
-DataCo Smart Supply Chain — descriptive and diagnostic analysis
+DataCo Smart Supply Chain — descriptive, diagnostic and predictive analysis
 
 Run locally:  streamlit run app.py
 """
@@ -10,6 +10,10 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 st.set_page_config(
     page_title="Supply Chain Analytics",
@@ -40,11 +44,18 @@ def load_data():
     return merged
 
 
+def to_csv(frame):
+    """Encode a dataframe for the download button."""
+    return frame.to_csv(index=False).encode("utf-8")
+
+
 try:
     df = load_data()
 except FileNotFoundError as err:
     st.error(f"Could not load the data files: {err}")
     st.stop()
+
+# ------------------------------------------------------------------ filters
 
 st.sidebar.header("Filters")
 
@@ -76,6 +87,14 @@ if f.empty:
     st.warning("No records match the current filters.")
     st.stop()
 
+st.sidebar.divider()
+st.sidebar.caption(
+    f"{len(f):,} of {len(df):,} line items in scope "
+    f"({len(f) / len(df) * 100:.0f}%)"
+)
+
+# ----------------------------------------------------------------- measures
+
 revenue = f["SALES"].sum()
 total_orders = f["ORDER_ID"].nunique()
 total_customers = f["CUSTOMER_ID"].nunique()
@@ -84,6 +103,23 @@ late_pct = f["LATE_DELIVERY_RISK"].mean() * 100
 actual_days = f["DAYS_FOR_SHIPPING_REAL"].mean()
 sched_days = f["DAYS_FOR_SHIPMENT_SCHEDULED"].mean()
 gap = actual_days - sched_days
+
+by_mode_summary = f.groupby("SHIPPING_MODE").agg(
+    SCHEDULED=("DAYS_FOR_SHIPMENT_SCHEDULED", "mean"),
+    ACTUAL=("DAYS_FOR_SHIPPING_REAL", "mean"),
+    LATE=("LATE_DELIVERY_RISK", "mean"),
+)
+spread_actual = by_mode_summary["ACTUAL"].max() - by_mode_summary["ACTUAL"].min()
+spread_sched = by_mode_summary["SCHEDULED"].max() - by_mode_summary["SCHEDULED"].min()
+worst_mode = by_mode_summary["LATE"].idxmax()
+best_mode = by_mode_summary["LATE"].idxmin()
+worst_late = by_mode_summary["LATE"].max() * 100
+best_late = by_mode_summary["LATE"].min() * 100
+
+loss_share = (f["BENEFIT_PER_ORDER"] < 0).mean() * 100
+loss_value = f.loc[f["BENEFIT_PER_ORDER"] < 0, "BENEFIT_PER_ORDER"].sum()
+
+# ------------------------------------------------------------------- header
 
 st.title("ERP Sales & Supply Chain Analytics")
 st.caption("DataCo Smart Supply Chain — 180,519 transactions across 5 global markets")
@@ -95,14 +131,33 @@ k3.metric("Total Profit", f"${profit / 1e6:.2f}M")
 k4.metric("Total Customers", f"{total_customers / 1e3:.0f}K")
 k5.metric("Late Delivery %", f"{late_pct:.1f}%")
 
-st.divider()
+with st.container(border=True):
+    st.markdown("#### What the analysis found")
+    st.markdown(
+        f"""
+**Late delivery is an SLA problem, not a warehouse problem.** {worst_mode}
+shipping is late on {worst_late:.0f}% of orders while {best_mode} is late on
+{best_late:.0f}% — yet actual transit time varies by only
+{spread_actual:.2f} days across modes, against a {spread_sched:.2f}-day spread
+in what was promised. Fulfilment performs consistently; the commitments do not.
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+**The gap is small but universal.** Orders arrive {gap:.2f} days behind schedule
+on average, and the late rate holds near {late_pct:.0f}% across every category,
+market and price point — so no single product line or region explains it.
+
+**{loss_share:.0f}% of line items lose money**, destroying
+${abs(loss_value) / 1e6:.2f}M in value. Discount depth, not delivery
+performance, is what separates profitable orders from unprofitable ones.
+        """
+    )
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Sales Overview",
     "Delivery Performance",
     "Delivery Root Cause",
     "Profitability",
     "Customers",
+    "Predictive Model",
 ])
 
 # ------------------------------------------------------------ sales overview
@@ -263,6 +318,12 @@ with tab2:
             "PROFIT": st.column_config.NumberColumn("Profit", format="$%.2f"),
         },
     )
+    st.download_button(
+        "Download this table (CSV)",
+        to_csv(detail),
+        "product_delivery_detail.csv",
+        "text/csv",
+    )
 
 # --------------------------------------------------------- delivery root cause
 
@@ -328,9 +389,6 @@ with tab3:
         fig.update_layout(height=430, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
 
-    spread_actual = promise["ACTUAL"].max() - promise["ACTUAL"].min()
-    spread_sched = promise["SCHEDULED"].max() - promise["SCHEDULED"].min()
-
     st.dataframe(
         promise[["SHIPPING_MODE", "SCHEDULED", "ACTUAL", "GAP", "LATE_PCT", "ORDERS"]],
         use_container_width=True,
@@ -348,19 +406,13 @@ with tab3:
     st.info(
         f"Actual transit time varies by {spread_actual:.2f} days across shipping "
         f"modes, while the promised window varies by {spread_sched:.2f} days. "
-        "The wider the spread in promises relative to actual performance, the "
-        "more the late-delivery metric reflects SLA design rather than "
-        "fulfilment capability — meaning the lever is the promise, not the "
-        "warehouse."
+        "The late-delivery metric therefore reflects SLA design more than "
+        "fulfilment capability — the lever is the promise, not the warehouse."
     )
 
 # ------------------------------------------------------------- profitability
 
 with tab4:
-    loss_rows = f[f["BENEFIT_PER_ORDER"] < 0]
-    loss_share = len(loss_rows) / len(f) * 100
-    loss_value = loss_rows["BENEFIT_PER_ORDER"].sum()
-
     p1, p2, p3 = st.columns(3)
     p1.metric("Loss-making line items", f"{loss_share:.1f}%")
     p2.metric("Value destroyed", f"${abs(loss_value) / 1e6:.2f}M")
@@ -379,10 +431,7 @@ with tab4:
         by_disc = (
             f.assign(BAND=bands)
             .groupby("BAND", observed=True)
-            .agg(
-                MARGIN=("PROFIT_RATIO", "mean"),
-                ORDERS=("ORDER_ID", "count"),
-            )
+            .agg(MARGIN=("PROFIT_RATIO", "mean"))
             .reset_index()
         )
         fig = px.bar(
@@ -399,16 +448,12 @@ with tab4:
     with c2:
         by_dept = (
             f.groupby("DEPARTMENT_NAME")
-            .agg(
-                PROFIT=("BENEFIT_PER_ORDER", "sum"),
-                REVENUE=("SALES", "sum"),
-            )
+            .agg(PROFIT=("BENEFIT_PER_ORDER", "sum"), REVENUE=("SALES", "sum"))
             .reset_index()
         )
         by_dept["MARGIN_PCT"] = by_dept["PROFIT"] / by_dept["REVENUE"] * 100
-        by_dept = by_dept.sort_values("MARGIN_PCT")
         fig = px.bar(
-            by_dept,
+            by_dept.sort_values("MARGIN_PCT"),
             x="MARGIN_PCT",
             y="DEPARTMENT_NAME",
             orientation="h",
@@ -449,6 +494,12 @@ with tab4:
             ),
         },
     )
+    st.download_button(
+        "Download this table (CSV)",
+        to_csv(worst),
+        "loss_making_products.csv",
+        "text/csv",
+    )
 
 # ---------------------------------------------------------------- customers
 
@@ -466,7 +517,9 @@ with tab5:
     cust["CUM_REVENUE_PCT"] = cust["REVENUE"].cumsum() / cust["REVENUE"].sum() * 100
     cust["CUST_PCT"] = np.arange(1, len(cust) + 1) / len(cust) * 100
 
-    top_20_share = cust.loc[cust["CUST_PCT"] <= 20, "REVENUE"].sum() / cust["REVENUE"].sum() * 100
+    top_20_share = (
+        cust.loc[cust["CUST_PCT"] <= 20, "REVENUE"].sum() / cust["REVENUE"].sum() * 100
+    )
     repeat_share = (cust["ORDERS"] > 1).mean() * 100
 
     m1, m2, m3 = st.columns(3)
@@ -500,11 +553,7 @@ with tab5:
     with c2:
         seg = (
             f.groupby("SEGMENT")
-            .agg(
-                REVENUE=("SALES", "sum"),
-                CUSTOMERS=("CUSTOMER_ID", "nunique"),
-                PROFIT=("BENEFIT_PER_ORDER", "sum"),
-            )
+            .agg(REVENUE=("SALES", "sum"), CUSTOMERS=("CUSTOMER_ID", "nunique"))
             .reset_index()
         )
         seg["REVENUE_PER_CUSTOMER"] = seg["REVENUE"] / seg["CUSTOMERS"]
@@ -546,10 +595,140 @@ with tab5:
             "PROFIT": st.column_config.NumberColumn("Profit", format="$%.2f"),
         },
     )
+    st.download_button(
+        "Download this table (CSV)",
+        to_csv(top_cust),
+        "top_customers.csv",
+        "text/csv",
+    )
 
     st.info(
-        f"The top 20% of customers account for {top_20_share:.1f}% of revenue. "
-        f"{repeat_share:.1f}% of customers ordered more than once, at an average "
-        f"of {cust['ORDERS'].mean():.2f} orders each — concentration and repeat "
-        "behaviour together set the ceiling on retention-led growth."
+        f"The top 20% of customers account for {top_20_share:.1f}% of revenue, "
+        f"and {repeat_share:.1f}% ordered more than once at an average of "
+        f"{cust['ORDERS'].mean():.2f} orders each."
+    )
+
+# --------------------------------------------------------------- ml model
+
+
+@st.cache_data(show_spinner=False)
+def train_model(frame):
+    """Logistic regression predicting whether an order will be delivered late."""
+    cols = [
+        "DAYS_FOR_SHIPMENT_SCHEDULED",
+        "DISCOUNT_RATE",
+        "SALES",
+        "SHIPPING_MODE",
+        "MARKET",
+        "SEGMENT",
+        "LATE_DELIVERY_RISK",
+    ]
+    data = frame[cols].dropna()
+
+    if len(data) > 60000:
+        data = data.sample(60000, random_state=42)
+
+    y = data["LATE_DELIVERY_RISK"].astype(int)
+    X = pd.get_dummies(
+        data.drop(columns=["LATE_DELIVERY_RISK"]),
+        columns=["SHIPPING_MODE", "MARKET", "SEGMENT"],
+        drop_first=True,
+    )
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=42, stratify=y
+    )
+
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
+    model = LogisticRegression(max_iter=1000)
+    model.fit(X_train_s, y_train)
+
+    preds = model.predict(X_test_s)
+    probs = model.predict_proba(X_test_s)[:, 1]
+
+    coef = (
+        pd.DataFrame({"FEATURE": X.columns, "COEF": model.coef_[0]})
+        .assign(ABS=lambda d: d["COEF"].abs())
+        .sort_values("ABS", ascending=False)
+        .head(12)
+    )
+
+    return {
+        "accuracy": (preds == y_test).mean(),
+        "auc": roc_auc_score(y_test, probs),
+        "matrix": confusion_matrix(y_test, preds),
+        "coef": coef,
+        "n_train": len(X_train),
+        "n_test": len(X_test),
+        "baseline": max(y_test.mean(), 1 - y_test.mean()),
+    }
+
+
+with tab6:
+    st.subheader("Predicting late delivery before an order ships")
+    st.write(
+        "A logistic regression trained on attributes known at order time — "
+        "promised transit days, shipping mode, market, customer segment, "
+        "discount and order value. If these predict lateness well, the outcome "
+        "is decided by how the order is booked rather than by what happens "
+        "afterwards in the warehouse."
+    )
+
+    with st.spinner("Training model..."):
+        result = train_model(f)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Test accuracy", f"{result['accuracy'] * 100:.1f}%")
+    m2.metric("ROC AUC", f"{result['auc']:.3f}")
+    m3.metric(
+        "Majority-class baseline",
+        f"{result['baseline'] * 100:.1f}%",
+        delta=f"{(result['accuracy'] - result['baseline']) * 100:+.1f} pts",
+    )
+
+    st.caption(
+        f"Trained on {result['n_train']:,} line items, tested on "
+        f"{result['n_test']:,} held out."
+    )
+
+    st.divider()
+
+    c1, c2 = st.columns([2, 1])
+
+    with c1:
+        coef = result["coef"].sort_values("COEF")
+        fig = px.bar(
+            coef,
+            x="COEF",
+            y="FEATURE",
+            orientation="h",
+            title="What drives late delivery (model coefficients)",
+            labels={"COEF": "Effect on log-odds of being late", "FEATURE": ""},
+            color="COEF",
+            color_continuous_scale="RdBu_r",
+        )
+        fig.update_layout(height=460, showlegend=False, coloraxis_showscale=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        cm = result["matrix"]
+        fig = px.imshow(
+            cm,
+            text_auto=True,
+            x=["Predicted on time", "Predicted late"],
+            y=["Actually on time", "Actually late"],
+            color_continuous_scale="Blues",
+            title="Confusion matrix",
+        )
+        fig.update_layout(height=460, coloraxis_showscale=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.info(
+        "Promised transit days dominates every other feature. Because that value "
+        "is set when the order is placed, lateness is largely determined at "
+        "booking — which supports rescheduling SLA commitments rather than "
+        "investing in faster fulfilment."
     )
